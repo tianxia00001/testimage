@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>无限画布图片生成</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <aside class="sidebar">
+        <header class="brand">
+          <h1>无限画布</h1>
+          <p id="modelInfo">读取模型配置中...</p>
+        </header>
+        <button id="newCanvasButton" class="primary-action" type="button">新建画布</button>
+        <nav id="canvasList" class="canvas-list" aria-label="画布列表"></nav>
+      </aside>
+
+      <section class="canvas-area">
+        <header class="canvas-toolbar">
+          <div>
+            <strong id="activeCanvasName">画布</strong>
+            <span id="targetInfo">点击画布选择生成位置</span>
+          </div>
+          <div class="toolbar-meta">
+            <span id="zoomInfo">100%</span>
+            <span>拖动空白移动 · 滚轮缩放</span>
+            <button id="renameCanvasButton" class="toolbar-button" type="button">重命名</button>
+            <button id="exportCanvasButton" class="toolbar-button" type="button">导出 PNG</button>
+          </div>
+        </header>
+
+        <div id="canvasViewport" class="canvas-viewport" tabindex="0" aria-label="无限画布">
+          <div id="canvasWorld" class="canvas-world"></div>
+          <div id="targetMarker" class="target-marker" hidden></div>
+          <div id="canvasHint" class="canvas-hint">点击任意空白位置，然后在右侧输入提示词生成图片</div>
+        </div>
+      </section>
+
+      <aside class="inspector">
+        <form id="generateForm" class="panel">
+          <header class="panel-header">
+            <h2>生成图片</h2>
+            <span id="positionText">未选择位置</span>
+          </header>
+          <label for="prompt">提示词</label>
+          <textarea id="prompt" name="prompt" rows="7" placeholder="描述你想生成的图片"></textarea>
+          <label for="imageModelSelect">生成模型</label>
+          <select id="imageModelSelect" name="imageModel">
+            <option value="seedream">Seedream 4.5（默认）</option>
+            <option value="openrouter-gpt-image-2">OpenRouter GPT Image 2</option>
+            <option value="openrouter-gemini-image">OpenRouter Gemini Image</option>
+          </select>
+          <div class="prompt-tools">
+            <button id="optimizePromptButton" class="small-button" type="button">优化提示词</button>
+            <span id="promptOptimizeStatus"></span>
+          </div>
+          <div id="promptSuggestion" class="suggestion-box" hidden>
+            <strong>优化建议</strong>
+            <p id="optimizedPromptText"></p>
+            <ul id="optimizedPromptChanges"></ul>
+            <div class="suggestion-actions">
+              <button id="acceptPromptButton" class="small-button" type="button">采用</button>
+              <button id="rejectPromptButton" class="small-button" type="button">不采用</button>
+            </div>
+          </div>
+          <div class="reference-upload">
+            <label for="referenceImageInput">参考图</label>
+            <input id="referenceImageInput" type="file" accept="image/png,image/jpeg,image/webp">
+            <div id="referencePreview" class="reference-preview" hidden>
+              <img id="referencePreviewImage" alt="参考图预览">
+              <button id="clearReferenceButton" type="button">移除参考图</button>
+            </div>
+            <button id="useSelectedImageButton" class="small-button" type="button">使用选中图片</button>
+          </div>
+          <input id="size" name="size" type="hidden" value="1920x1920">
+          <button id="generateButton" type="submit" disabled>生成到画布</button>
+          <div id="statusMessage" class="status-message" hidden></div>
+        </form>
+
+        <section class="panel evaluation-panel">
+          <header class="panel-header">
+            <h2>图片评价</h2>
+            <button id="evaluateImageButton" class="small-button" type="button">评价选中图片</button>
+          </header>
+          <div id="evaluationResult" class="evaluation-result">选中画布中的图片后，可以让千问给出重点修改建议。</div>
+        </section>
+
+        <section class="panel insights-panel">
+          <header class="panel-header">
+            <div>
+              <h2>共性提示词</h2>
+              <span id="insightsMeta">分析历史提示词</span>
+            </div>
+            <button id="refineInsightsButton" class="small-button" type="button">AI 精修</button>
+          </header>
+          <div class="insights-actions">
+            <button id="buildTemplateButton" class="small-button" type="button">生成模板</button>
+            <span id="insightsStatus"></span>
+          </div>
+          <div id="styleSummary" class="style-summary" hidden></div>
+          <div id="insightsList" class="insights-list"></div>
+        </section>
+
+        <section class="panel history-panel">
+          <header class="panel-header">
+            <h2>历史提示词</h2>
+            <div class="segmented" role="group" aria-label="历史范围">
+              <button id="historyAllButton" type="button" data-filter="all" class="is-active">全部</button>
+              <button id="historyCurrentButton" type="button" data-filter="current">当前</button>
+            </div>
+          </header>
+          <div id="historyList" class="history-list"></div>
+        </section>
+      </aside>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
