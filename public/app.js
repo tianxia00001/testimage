@@ -3,6 +3,8 @@ const newCanvasButton = document.querySelector("#newCanvasButton");
 const activeCanvasName = document.querySelector("#activeCanvasName");
 const renameCanvasButton = document.querySelector("#renameCanvasButton");
 const exportCanvasButton = document.querySelector("#exportCanvasButton");
+const importFolderButton = document.querySelector("#importFolderButton");
+const importFolderInput = document.querySelector("#importFolderInput");
 const modelInfo = document.querySelector("#modelInfo");
 const canvasViewport = document.querySelector("#canvasViewport");
 const canvasWorld = document.querySelector("#canvasWorld");
@@ -94,6 +96,8 @@ newCanvasButton.addEventListener("click", async () => {
 
 renameCanvasButton.addEventListener("click", renameActiveCanvas);
 exportCanvasButton.addEventListener("click", exportActiveCanvas);
+importFolderButton.addEventListener("click", () => importFolderInput.click());
+importFolderInput.addEventListener("change", importImageFolder);
 optimizePromptButton.addEventListener("click", optimizeCurrentPrompt);
 acceptPromptButton.addEventListener("click", acceptOptimizedPrompt);
 rejectPromptButton.addEventListener("click", rejectOptimizedPrompt);
@@ -247,6 +251,11 @@ function getPrimarySelectedImage() {
 function getLastSelectedImageId() {
   const values = Array.from(selectedImageIds);
   return values.length ? values[values.length - 1] : null;
+}
+
+function getImportOrigin() {
+  if (selectedTarget) return { ...selectedTarget };
+  return screenPointToWorld(48, 96);
 }
 
 function syncPrimarySelection() {
@@ -653,6 +662,15 @@ function readFileAsDataUrl(file) {
   });
 }
 
+function getImageDimensions(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve({ width: image.naturalWidth || 280, height: image.naturalHeight || 280 });
+    image.onerror = () => reject(new Error("图片尺寸读取失败"));
+    image.src = dataUrl;
+  });
+}
+
 function readBlobAsDataUrl(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -660,6 +678,84 @@ function readBlobAsDataUrl(blob) {
     reader.onerror = () => reject(new Error("图片读取失败"));
     reader.readAsDataURL(blob);
   });
+}
+
+async function importImageFolder() {
+  const canvasId = activeCanvasId;
+  const files = Array.from(importFolderInput.files || [])
+    .filter(file => /^image\/(png|jpe?g|webp)$/i.test(file.type))
+    .sort((a, b) => (a.webkitRelativePath || a.name).localeCompare(b.webkitRelativePath || b.name, "zh-Hans-CN"));
+  importFolderInput.value = "";
+
+  if (!canvasId) {
+    showStatus("请先选择一个画布。", "error");
+    return;
+  }
+  if (files.length === 0) {
+    showStatus("文件夹中没有可导入的 PNG、JPG 或 WEBP 图片。", "error");
+    return;
+  }
+  if (files.length > 80) {
+    showStatus("一次最多导入 80 张图片，请拆分文件夹后再试。", "error");
+    return;
+  }
+
+  const origin = getImportOrigin();
+  const cellWidth = 340;
+  const cellHeight = 380;
+  const columns = 4;
+  const importedImages = [];
+  const importedHistory = [];
+  setControlBusy(importFolderButton, true);
+  showStatus(`正在导入 ${files.length} 张图片...`, "info");
+
+  try {
+    for (let start = 0; start < files.length; start += 2) {
+      const batchFiles = files.slice(start, start + 2);
+      const images = [];
+      for (const [batchIndex, file] of batchFiles.entries()) {
+        if (file.size > 10 * 1024 * 1024) {
+          throw new Error(`${file.name} 超过 10MB，已停止导入。`);
+        }
+        const index = start + batchIndex;
+        const dataUrl = await readFileAsDataUrl(file);
+        const dimensions = await getImageDimensions(dataUrl);
+        const displayWidth = Math.min(320, Math.max(180, dimensions.width));
+        images.push({
+          name: file.webkitRelativePath || file.name,
+          dataUrl,
+          width: dimensions.width,
+          height: dimensions.height,
+          displayWidth,
+          x: origin.x + (index % columns) * cellWidth,
+          y: origin.y + Math.floor(index / columns) * cellHeight
+        });
+      }
+      const data = await apiJson("/api/images/import", {
+        method: "POST",
+        body: { canvasId, images }
+      });
+      importedImages.push(...(Array.isArray(data.images) ? data.images : []));
+      importedHistory.push(...(Array.isArray(data.history) ? data.history : []));
+      showStatus(`已导入 ${importedImages.length}/${files.length} 张图片...`, "info");
+    }
+
+    appState.images.push(...importedImages);
+    appState.history.push(...importedHistory);
+    if (importedImages.length) {
+      selectedImageIds = new Set(importedImages.map(image => image.id));
+      selectedImageId = importedImages[importedImages.length - 1].id;
+    }
+    selectedTarget = null;
+    await refreshPromptInsights();
+    renderAll();
+    showStatus(`已导入 ${importedImages.length} 张图片。`, "success");
+  } catch (error) {
+    showStatus(`导入失败：${error.message}`, "error");
+    renderAll();
+  } finally {
+    setControlBusy(importFolderButton, false);
+  }
 }
 
 function renderInsights() {

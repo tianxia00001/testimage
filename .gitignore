@@ -1,6 +1,7 @@
 .env
 data/
 generated/
+runs/
 node_modules/
 npm-debug.log*
 *.log

@@ -1,0 +1,7 @@
+{
+  "serverUrl": "http://localhost:8787",
+  "archiveDir": "runs",
+  "seedreamSize": "1920x1920",
+  "openrouterSize": "1920x1920",
+  "notificationWaitSeconds": 45
+}

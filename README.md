@@ -25,3 +25,15 @@ npm start
 4. Open the local app on port `8787`.
 
 Runtime files in `data/` and generated images in `generated/` are intentionally ignored by git.
+
+## Daily workflow
+
+Double-click `run-workflow.vbs` to run the local workflow without opening a console window. It starts the local server if needed, runs the image workflow, archives outputs under `runs/YYYY-MM-DD/`, and shows a Windows tray notification.
+
+To register the daily 09:45 Windows task, run PowerShell from the project folder:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\register-daily-task.ps1
+```
+
+After a run, open `http://localhost:8787/workflow/feedback?run=YYYY-MM-DD` to review images and save the next manual revision note. The next workflow run uses only the latest non-empty feedback.

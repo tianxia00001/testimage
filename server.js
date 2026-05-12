@@ -4,13 +4,16 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
 const generatedDir = path.join(__dirname, "generated");
 const dataDir = path.join(__dirname, "data");
+const runsDir = path.join(__dirname, "runs");
 const stateFile = path.join(dataDir, "canvases.json");
 const failureLogFile = path.join(dataDir, "generation-failures.jsonl");
+const workflowFeedbackFile = path.join(dataDir, "workflow-feedback.json");
 
 loadEnv(path.join(__dirname, ".env"));
 
@@ -24,6 +27,8 @@ const config = {
   openrouterBaseUrl: trimEnd(process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1", "/"),
   openrouterImageModel: process.env.OPENROUTER_IMAGE_MODEL || "openai/gpt-5.4-image-2",
   openrouterFallbackImageModel: process.env.OPENROUTER_FALLBACK_IMAGE_MODEL || "google/gemini-3.1-flash-image-preview",
+  openrouterImageSize: normalizeOpenRouterImageSize(process.env.OPENROUTER_IMAGE_SIZE || "1K"),
+  openrouterMaxTokens: Math.max(1, Math.floor(Number(process.env.OPENROUTER_MAX_TOKENS || 1024))),
   deepseekApiKey: process.env.DEEPSEEK_API_KEY,
   deepseekBaseUrl: trimEnd(process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com", "/"),
   deepseekModel: process.env.DEEPSEEK_MODEL || "deepseek-chat",
@@ -93,6 +98,22 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/generate") {
       return handleGenerateWithProvider(req, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/images/import") {
+      return handleImportImages(req, res);
+    }
+
+    if (req.method === "GET" && url.pathname === "/workflow/feedback") {
+      return handleWorkflowFeedbackPage(url, res);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/workflow/feedback") {
+      return handleWorkflowFeedbackSave(req, res);
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/workflow/runs/")) {
+      return serveWorkflowRunFile(url.pathname, res);
     }
 
     if (req.method === "GET" && url.pathname.startsWith("/generated/")) {
@@ -286,6 +307,7 @@ async function handleImageEvaluate(imageId, req, res) {
   const body = await readJsonBody(req);
   const prompt = typeof body.prompt === "string" && body.prompt.trim() ? body.prompt.trim() : image.prompt;
   const imageDataUrl = await imageUrlToDataUrl(image.url);
+  const workflowJson = body.format === "workflow-json";
 
   const apiResponse = await fetch(`${config.qwenBaseUrl}/chat/completions`, {
     method: "POST",
@@ -299,19 +321,35 @@ async function handleImageEvaluate(imageId, req, res) {
       messages: [
         {
           role: "system",
-          content: "You are a strict image generation reviewer. Focus on important actionable revision suggestions. Answer in Chinese."
+          content: workflowJson
+            ? [
+                "You are a strict image generation reviewer.",
+                "Focus on important actionable revision suggestions.",
+                "Answer in strict JSON only, with keys: overall, issues, suggestions, improvedPrompt.",
+                "issues and suggestions must be arrays of short Chinese strings.",
+                "improvedPrompt must be one ready-to-use Chinese image generation prompt."
+              ].join(" ")
+            : "You are a strict image generation reviewer. Focus on important actionable revision suggestions. Answer in Chinese."
         },
         {
           role: "user",
           content: [
             {
               type: "text",
-              text: [
-                "请评价这张生成图是否符合提示词，并重点给出重要修改建议。",
-                "不要泛泛表扬，优先指出最值得改的 3-6 点。",
-                "输出格式：总体判断、主要问题、修改建议、可直接使用的改进提示词。",
-                `原始提示词：${prompt}`
-              ].join("\n")
+              text: workflowJson
+                ? [
+                    "请评价这张生成图是否符合提示词，并输出严格 JSON。",
+                    "不要泛泛表扬，优先指出最值得改的 3-6 点。",
+                    "JSON 字段：overall, issues, suggestions, improvedPrompt。",
+                    "improvedPrompt 要保留原始主体和风格，并吸收你认为最重要的修改建议。",
+                    `原始提示词：${prompt}`
+                  ].join("\n")
+                : [
+                    "请评价这张生成图是否符合提示词，并重点给出重要修改建议。",
+                    "不要泛泛表扬，优先指出最值得改的 3-6 点。",
+                    "输出格式：总体判断、主要问题、修改建议、可直接使用的改进提示词。",
+                    `原始提示词：${prompt}`
+                  ].join("\n")
             },
             {
               type: "image_url",
@@ -337,12 +375,34 @@ async function handleImageEvaluate(imageId, req, res) {
     return sendJson(res, 502, { error: "Qwen response did not include content", detail: parsed });
   }
 
+  const structured = workflowJson ? normalizeWorkflowEvaluation(evaluation, prompt) : null;
   sendJson(res, 200, {
     imageId,
     prompt,
     evaluation: evaluation.trim(),
-    model: config.qwenEvaluationModel
+    model: config.qwenEvaluationModel,
+    ...(structured ? { workflow: structured, improvedPrompt: structured.improvedPrompt } : {})
   });
+}
+
+function normalizeWorkflowEvaluation(content, fallbackPrompt) {
+  const parsed = parseJsonFromText(content) || safeJsonParse(content);
+  if (!parsed || typeof parsed !== "object") {
+    return {
+      overall: "",
+      issues: [],
+      suggestions: [],
+      improvedPrompt: fallbackPrompt
+    };
+  }
+  return {
+    overall: typeof parsed.overall === "string" ? parsed.overall.trim() : "",
+    issues: Array.isArray(parsed.issues) ? parsed.issues.filter(item => typeof item === "string").slice(0, 8) : [],
+    suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions.filter(item => typeof item === "string").slice(0, 8) : [],
+    improvedPrompt: typeof parsed.improvedPrompt === "string" && parsed.improvedPrompt.trim()
+      ? parsed.improvedPrompt.trim()
+      : fallbackPrompt
+  };
 }
 
 async function handleCreateCanvas(req, res) {
@@ -403,6 +463,148 @@ async function handleDeleteImage(imageId, res) {
   }
   await saveState();
   sendJson(res, 200, { imageId: image.id });
+}
+
+async function handleWorkflowFeedbackPage(url, res) {
+  const run = sanitizeRunDate(url.searchParams.get("run")) || localDateString();
+  const runDir = path.join(runsDir, run);
+  const manifest = await readOptionalJson(path.join(runDir, "run.json")) || {};
+  const feedback = await readOptionalText(path.join(runDir, "manual-feedback.md")) || "";
+  const imageFiles = await listWorkflowImages(runDir);
+  const promptSummary = await readOptionalText(path.join(runDir, "prompts", "04-qwen-improved.md"))
+    || await readOptionalText(path.join(runDir, "prompts", "02-deepseek-optimized.json"))
+    || "";
+  const status = manifest.status || "unknown";
+  const imageMarkup = imageFiles.map(file => {
+    const src = `/workflow/runs/${encodeURIComponent(run)}/images/${encodeURIComponent(file)}`;
+    return `<figure><img src="${src}" alt="${escapeHtml(file)}"><figcaption>${escapeHtml(file)}</figcaption></figure>`;
+  }).join("");
+  const html = `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>工作流反馈 ${escapeHtml(run)}</title>
+    <style>
+      body { margin: 0; font-family: "Microsoft YaHei", Arial, sans-serif; background: #f5f7fb; color: #1f2937; }
+      main { max-width: 1080px; margin: 0 auto; padding: 28px; }
+      h1 { margin: 0 0 8px; font-size: 24px; }
+      .meta { color: #64748b; margin-bottom: 20px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin: 18px 0; }
+      figure { margin: 0; background: white; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }
+      img { display: block; width: 100%; height: auto; }
+      figcaption { padding: 10px; font-size: 13px; color: #64748b; word-break: break-all; }
+      textarea { box-sizing: border-box; width: 100%; min-height: 150px; padding: 12px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; }
+      button { margin-top: 10px; padding: 10px 16px; border: 0; border-radius: 8px; background: #2563eb; color: white; cursor: pointer; }
+      pre { white-space: pre-wrap; background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; max-height: 280px; overflow: auto; }
+      .saved { color: #047857; margin-left: 10px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>每日工作流反馈</h1>
+      <div class="meta">日期：${escapeHtml(run)} · 状态：${escapeHtml(status)} · 归档：runs/${escapeHtml(run)}</div>
+      <h2>生成图片</h2>
+      <div class="grid">${imageMarkup || "<p>暂无归档图片。</p>"}</div>
+      <h2>最终提示词摘要</h2>
+      <pre>${escapeHtml(promptSummary || "暂无提示词摘要。")}</pre>
+      <h2>人工修改意见</h2>
+      <textarea id="feedback" placeholder="写下你希望下次自动生成时采用的修改意见。">${escapeHtml(feedback)}</textarea>
+      <div><button id="saveButton" type="button">保存意见</button><span id="saveStatus" class="saved"></span></div>
+    </main>
+    <script>
+      document.querySelector("#saveButton").addEventListener("click", async () => {
+        const response = await fetch("/api/workflow/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ run: ${JSON.stringify(run)}, feedback: document.querySelector("#feedback").value })
+        });
+        const data = await response.json().catch(() => ({}));
+        document.querySelector("#saveStatus").textContent = response.ok ? "已保存" : (data.error || "保存失败");
+      });
+    </script>
+  </body>
+</html>`;
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+  res.end(html);
+}
+
+async function handleWorkflowFeedbackSave(req, res) {
+  const body = await readJsonBody(req);
+  const run = sanitizeRunDate(body.run) || localDateString();
+  const feedback = typeof body.feedback === "string" ? body.feedback.trim() : "";
+  const runDir = path.join(runsDir, run);
+  await mkdir(runDir, { recursive: true });
+  await writeFile(path.join(runDir, "manual-feedback.md"), feedback, "utf8");
+  if (feedback) {
+    await mkdir(dataDir, { recursive: true });
+    await writeFile(workflowFeedbackFile, JSON.stringify({
+      run,
+      feedback,
+      updatedAt: new Date().toISOString()
+    }, null, 2), "utf8");
+  }
+  sendJson(res, 200, { ok: true, run, hasFeedback: Boolean(feedback) });
+}
+
+async function handleImportImages(req, res) {
+  const body = await readJsonBody(req);
+  const canvasId = typeof body.canvasId === "string" ? body.canvasId : "";
+  const canvas = state.canvases.find(item => item.id === canvasId);
+  if (!canvas) return sendJson(res, 400, { error: "Please select a valid canvas" });
+
+  const imports = normalizeImportedImages(body.images);
+  if (imports.length === 0) return sendJson(res, 400, { error: "No supported images were provided" });
+
+  const now = new Date().toISOString();
+  const createdImages = [];
+  const createdHistory = [];
+  await mkdir(generatedDir, { recursive: true });
+
+  for (const [index, item] of imports.entries()) {
+    const imageUrl = await persistImportedDataUrl(item.dataUrl);
+    const naturalWidth = Math.max(1, toFiniteNumber(item.width, 280));
+    const naturalHeight = Math.max(1, toFiniteNumber(item.height, 280));
+    const displayWidth = clamp(toFiniteNumber(item.displayWidth, Math.min(320, naturalWidth)), 140, 420);
+    const displayHeight = clamp(displayWidth * (naturalHeight / naturalWidth), 120, 520);
+    const prompt = `导入：${item.name || `image-${index + 1}`}`;
+    const image = {
+      id: createId("image"),
+      canvasId,
+      url: imageUrl,
+      prompt,
+      model: "local-import",
+      provider: "import",
+      size: `${Math.round(naturalWidth)}x${Math.round(naturalHeight)}`,
+      generationMode: "import",
+      referenceImageCount: 0,
+      x: toFiniteNumber(item.x, 0),
+      y: toFiniteNumber(item.y, 0),
+      width: displayWidth,
+      height: displayHeight,
+      createdAt: now,
+      updatedAt: now
+    };
+    const history = {
+      id: createId("history"),
+      canvasId,
+      imageId: image.id,
+      prompt,
+      model: image.model,
+      provider: image.provider,
+      size: image.size,
+      generationMode: image.generationMode,
+      referenceImageCount: 0,
+      createdAt: now
+    };
+    state.images.push(image);
+    state.history.push(history);
+    createdImages.push(image);
+    createdHistory.push(history);
+  }
+
+  await saveState();
+  sendJson(res, 200, { images: createdImages, history: createdHistory, count: createdImages.length });
 }
 
 async function handleGenerate(req, res) {
@@ -651,37 +853,33 @@ async function generateVolcengineImage({ prompt, size, referenceImages }) {
 }
 
 async function generateOpenRouterImage({ prompt, size, referenceImages, model }) {
-  const generationPrompt = `Generate an image from this prompt. Return the generated image in the assistant message images field.\n\n${prompt}`;
   const content = referenceImages.length > 0
     ? [
-        { type: "text", text: generationPrompt },
+        { type: "text", text: prompt },
         ...referenceImages.map(url => ({ type: "image_url", image_url: { url } }))
       ]
-    : generationPrompt;
+    : prompt;
   const payload = {
     model,
     modalities: ["image", "text"],
+    max_tokens: config.openrouterMaxTokens,
     stream: false,
     messages: [{ role: "user", content }]
   };
+  const imageConfig = openRouterImageConfig(size);
+  if (imageConfig) {
+    payload.image_config = imageConfig;
+  }
 
-  const apiResponse = await fetch(`${config.openrouterBaseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${config.openrouterApiKey}`,
-      "Content-Type": "application/json",
-      "HTTP-Referer": "http://localhost:8787",
-      "X-Title": "Image Canvas"
-    },
-    body: JSON.stringify(payload)
-  });
-  const parsed = parseJsonResponseText(await apiResponse.text());
-  if (!apiResponse.ok) {
+  const apiResult = await postOpenRouterJson(payload);
+  const parsed = parseJsonResponseText(apiResult.text);
+  if (!apiResult.ok) {
     throw Object.assign(new Error("OpenRouter image generation failed"), {
-      status: apiResponse.status,
+      status: apiResult.status,
       detail: {
         response: normalizeApiError(parsed),
-        requestId: apiResponse.headers.get("x-request-id") || apiResponse.headers.get("cf-ray") || null
+        requestId: apiResult.requestId,
+        transport: apiResult.transport
       }
     });
   }
@@ -692,13 +890,132 @@ async function generateOpenRouterImage({ prompt, size, referenceImages, model })
   return imageResult;
 }
 
+async function postOpenRouterJson(payload) {
+  const url = `${config.openrouterBaseUrl}/chat/completions`;
+  const headers = openRouterHeaders();
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(payload)
+  });
+  const text = await response.text();
+  const result = {
+    ok: response.ok,
+    status: response.status,
+    text,
+    requestId: response.headers.get("x-request-id") || response.headers.get("cf-ray") || null,
+    transport: "fetch"
+  };
+
+  if (response.status === 500 && text.trim() === "Internal Server Error") {
+    try {
+      return await postOpenRouterJsonWithCurl(url, headers, payload);
+    } catch (error) {
+      return {
+        ...result,
+        text: JSON.stringify({
+          error: "OpenRouter returned Internal Server Error through fetch and curl fallback failed",
+          fetchResponse: text,
+          fallbackError: error.message
+        })
+      };
+    }
+  }
+
+  return result;
+}
+
+function openRouterHeaders() {
+  return {
+    "Authorization": `Bearer ${config.openrouterApiKey}`,
+    "Content-Type": "application/json",
+    "HTTP-Referer": "http://localhost:8787",
+    "X-Title": "Image Canvas"
+  };
+}
+
+function postOpenRouterJsonWithCurl(url, headers, payload) {
+  const executable = process.platform === "win32" ? "curl.exe" : "curl";
+  const args = [
+    "-sS",
+    "-w",
+    "\n__HTTP_STATUS__:%{http_code}",
+    "-X",
+    "POST",
+    url
+  ];
+  for (const [key, value] of Object.entries(headers)) {
+    args.push("-H", `${key}: ${value}`);
+  }
+  args.push("--data-binary", "@-");
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, { windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => {
+      child.kill();
+      reject(new Error("curl fallback timed out"));
+    }, 240000);
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", chunk => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", chunk => {
+      stderr += chunk;
+    });
+    child.on("error", error => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("close", code => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        reject(new Error(stderr.trim() || `curl exited with code ${code}`));
+        return;
+      }
+      const marker = "\n__HTTP_STATUS__:";
+      const markerIndex = stdout.lastIndexOf(marker);
+      if (markerIndex === -1) {
+        reject(new Error("curl response did not include HTTP status"));
+        return;
+      }
+      const text = stdout.slice(0, markerIndex);
+      const status = Number(stdout.slice(markerIndex + marker.length).trim());
+      resolve({
+        ok: status >= 200 && status < 300,
+        status,
+        text,
+        requestId: null,
+        transport: "curl"
+      });
+    });
+    child.stdin.end(JSON.stringify(payload));
+  });
+}
+
 function openRouterImageConfig(size) {
-  if (!/^\d+x\d+$/i.test(size)) return null;
-  const [width, height] = size.toLowerCase().split("x").map(value => Number(value));
-  if (!width || !height) return null;
-  if (width === height) return { aspect_ratio: "1:1" };
-  if (width > height) return { aspect_ratio: "16:9" };
-  return { aspect_ratio: "9:16" };
+  const normalized = typeof size === "string" ? size.trim() : "";
+  if (/^(1K|2K|4K)$/i.test(normalized)) {
+    return { aspect_ratio: "1:1", image_size: normalized.toUpperCase() };
+  }
+  if (!/^\d+x\d+$/i.test(normalized)) {
+    return { aspect_ratio: "1:1", image_size: "1K" };
+  }
+  const [width, height] = normalized.toLowerCase().split("x").map(value => Number(value));
+  if (!width || !height) return { aspect_ratio: "1:1", image_size: "1K" };
+  const image_size = config.openrouterImageSize;
+  if (width === height) return { aspect_ratio: "1:1", image_size };
+  if (width > height) return { aspect_ratio: "16:9", image_size };
+  return { aspect_ratio: "9:16", image_size };
+}
+
+function normalizeOpenRouterImageSize(size) {
+  return /^(1K|2K|4K)$/i.test(String(size || "").trim())
+    ? String(size).trim().toUpperCase()
+    : "1K";
 }
 
 async function logGenerationFailure(entry) {
@@ -741,6 +1058,17 @@ async function persistImageResult(imageResult) {
 
   await mkdir(generatedDir, { recursive: true });
   const buffer = Buffer.from(imageResult.data, "base64");
+  const ext = sniffImageExtension(buffer);
+  const filename = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
+  await writeFile(path.join(generatedDir, filename), buffer);
+  return `/generated/${filename}`;
+}
+
+async function persistImportedDataUrl(dataUrl) {
+  const match = dataUrl.match(/^data:image\/(png|jpe?g|webp);base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) throw new Error("Unsupported imported image data");
+  const buffer = Buffer.from(match[2], "base64");
+  if (buffer.length > 10 * 1024 * 1024) throw new Error("Imported image is larger than 10MB");
   const ext = sniffImageExtension(buffer);
   const filename = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${ext}`;
   await writeFile(path.join(generatedDir, filename), buffer);
@@ -1044,6 +1372,23 @@ function normalizeReferenceImages(input) {
     .slice(0, 4);
 }
 
+function normalizeImportedImages(input) {
+  if (!Array.isArray(input)) return [];
+  return input
+    .filter(item => item && typeof item === "object")
+    .map(item => ({
+      name: typeof item.name === "string" ? item.name.trim().slice(0, 180) : "",
+      dataUrl: typeof item.dataUrl === "string" ? item.dataUrl.trim() : "",
+      width: toFiniteNumber(item.width, 0),
+      height: toFiniteNumber(item.height, 0),
+      displayWidth: toFiniteNumber(item.displayWidth, 0),
+      x: toFiniteNumber(item.x, 0),
+      y: toFiniteNumber(item.y, 0)
+    }))
+    .filter(item => /^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/=]+$/i.test(item.dataUrl))
+    .slice(0, 20);
+}
+
 function parseJsonFromText(text) {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
@@ -1122,12 +1467,34 @@ async function serveGenerated(routePath, res) {
   }
 }
 
+async function serveWorkflowRunFile(routePath, res) {
+  const match = routePath.match(/^\/workflow\/runs\/(\d{4}-\d{2}-\d{2})\/images\/([^/]+)$/);
+  if (!match) return sendJson(res, 404, { error: "Not found" });
+  const run = sanitizeRunDate(match[1]);
+  const filename = path.basename(decodeURIComponent(match[2]));
+  const filePath = path.resolve(runsDir, run, "images", filename);
+  const allowedDir = path.resolve(runsDir, run, "images");
+  if (filePath !== allowedDir && !filePath.startsWith(`${allowedDir}${path.sep}`)) {
+    return sendJson(res, 403, { error: "Forbidden" });
+  }
+  try {
+    const content = await readFile(filePath);
+    res.writeHead(200, {
+      "Content-Type": mimeTypes[path.extname(filePath).toLowerCase()] || "application/octet-stream",
+      "Cache-Control": "no-store"
+    });
+    res.end(content);
+  } catch {
+    sendJson(res, 404, { error: "Not found" });
+  }
+}
+
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let raw = "";
     req.on("data", chunk => {
       raw += chunk;
-      if (raw.length > 25 * 1024 * 1024) {
+      if (raw.length > 40 * 1024 * 1024) {
         req.destroy();
         reject(new Error("Request body too large"));
       }
@@ -1193,6 +1560,52 @@ function safeJsonParse(text) {
   } catch {
     return null;
   }
+}
+
+async function readOptionalText(filePath) {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+async function readOptionalJson(filePath) {
+  const text = await readOptionalText(filePath);
+  return text ? safeJsonParse(text) : null;
+}
+
+async function listWorkflowImages(runDir) {
+  try {
+    const { readdir } = await import("node:fs/promises");
+    const entries = await readdir(path.join(runDir, "images"), { withFileTypes: true });
+    return entries
+      .filter(entry => entry.isFile() && /\.(png|jpe?g|webp)$/i.test(entry.name))
+      .map(entry => entry.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+function sanitizeRunDate(value) {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : "";
+}
+
+function localDateString(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 async function imageUrlToDataUrl(url) {
