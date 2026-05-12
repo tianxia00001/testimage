@@ -393,6 +393,42 @@ textarea:disabled {
   gap: 12px;
 }
 
+.panel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.panel-collapse-button {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.panel-collapse-button:hover {
+  border-color: rgba(23, 105, 170, 0.45);
+  color: var(--primary);
+}
+
+.panel.is-collapsed {
+  gap: 0;
+  min-height: 0;
+}
+
+.panel.is-collapsed > :not(.panel-header) {
+  display: none;
+}
+
 .panel h2 {
   font-size: 16px;
 }
@@ -716,6 +752,15 @@ button:focus-visible,
   display: flex;
   justify-content: flex-end;
   gap: 6px;
+}
+
+.danger-text-button {
+  color: var(--danger);
+}
+
+.danger-text-button:hover {
+  border-color: rgba(210, 74, 59, 0.35);
+  color: var(--danger);
 }
 
 .history-item.is-selected {

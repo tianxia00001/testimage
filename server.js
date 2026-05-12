@@ -96,6 +96,11 @@ const server = createServer(async (req, res) => {
       return handleDeleteImage(imageMatch[1], res);
     }
 
+    const historyMatch = url.pathname.match(/^\/api\/history\/([^/]+)$/);
+    if (req.method === "DELETE" && historyMatch) {
+      return handleDeleteHistory(historyMatch[1], res);
+    }
+
     if (req.method === "POST" && url.pathname === "/api/generate") {
       return handleGenerateWithProvider(req, res);
     }
@@ -463,6 +468,15 @@ async function handleDeleteImage(imageId, res) {
   }
   await saveState();
   sendJson(res, 200, { imageId: image.id });
+}
+
+async function handleDeleteHistory(historyId, res) {
+  const history = state.history.find(item => item.id === historyId);
+  if (!history) return sendJson(res, 404, { error: "History item not found" });
+
+  history.historyDeletedAt = new Date().toISOString();
+  await saveState();
+  sendJson(res, 200, { historyId: history.id });
 }
 
 async function handleWorkflowFeedbackPage(url, res) {
@@ -1139,7 +1153,8 @@ function ensureStateShape(input) {
       generationMode: typeof item.generationMode === "string" ? item.generationMode : "text-to-image",
       referenceImageCount: Math.max(0, toFiniteNumber(item.referenceImageCount, 0)),
       createdAt: typeof item.createdAt === "string" ? item.createdAt : now,
-      deletedAt: typeof item.deletedAt === "string" ? item.deletedAt : null
+      deletedAt: typeof item.deletedAt === "string" ? item.deletedAt : null,
+      historyDeletedAt: typeof item.historyDeletedAt === "string" ? item.historyDeletedAt : null
     })).filter(item => item.canvasId && item.prompt)
   };
 
@@ -1216,7 +1231,7 @@ function cloneState() {
 
 function selectInsightPrompts(scope, canvasId) {
   return state.history
-    .filter(item => item.prompt && (scope !== "current" || item.canvasId === canvasId))
+    .filter(item => item.prompt && !item.historyDeletedAt && (scope !== "current" || item.canvasId === canvasId))
     .map(item => item.prompt.trim())
     .filter(Boolean);
 }

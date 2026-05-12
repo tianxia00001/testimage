@@ -41,10 +41,13 @@
       </section>
 
       <aside class="inspector">
-        <form id="generateForm" class="panel">
+        <form id="generateForm" class="panel" data-panel-id="generate">
           <header class="panel-header">
             <h2>生成图片</h2>
-            <span id="positionText">未选择位置</span>
+            <div class="panel-actions">
+              <span id="positionText">未选择位置</span>
+              <button class="panel-collapse-button" type="button" aria-label="收起生成图片" aria-expanded="true" data-collapse-panel="generate">⌃</button>
+            </div>
           </header>
           <label for="prompt">提示词</label>
           <textarea id="prompt" name="prompt" rows="7" placeholder="描述你想生成的图片"></textarea>
@@ -81,21 +84,27 @@
           <div id="statusMessage" class="status-message" hidden></div>
         </form>
 
-        <section class="panel evaluation-panel">
+        <section class="panel evaluation-panel" data-panel-id="evaluation">
           <header class="panel-header">
             <h2>图片评价</h2>
-            <button id="evaluateImageButton" class="small-button" type="button">评价选中图片</button>
+            <div class="panel-actions">
+              <button id="evaluateImageButton" class="small-button" type="button">评价选中图片</button>
+              <button class="panel-collapse-button" type="button" aria-label="收起图片评价" aria-expanded="true" data-collapse-panel="evaluation">⌃</button>
+            </div>
           </header>
           <div id="evaluationResult" class="evaluation-result">选中画布中的图片后，可以让千问给出重点修改建议。</div>
         </section>
 
-        <section class="panel insights-panel">
+        <section class="panel insights-panel" data-panel-id="insights">
           <header class="panel-header">
             <div>
               <h2>共性提示词</h2>
               <span id="insightsMeta">分析历史提示词</span>
             </div>
-            <button id="refineInsightsButton" class="small-button" type="button">AI 精修</button>
+            <div class="panel-actions">
+              <button id="refineInsightsButton" class="small-button" type="button">AI 精修</button>
+              <button class="panel-collapse-button" type="button" aria-label="收起共性提示词" aria-expanded="true" data-collapse-panel="insights">⌃</button>
+            </div>
           </header>
           <div class="insights-actions">
             <button id="buildTemplateButton" class="small-button" type="button">生成模板</button>
@@ -105,12 +114,15 @@
           <div id="insightsList" class="insights-list"></div>
         </section>
 
-        <section class="panel history-panel">
+        <section class="panel history-panel" data-panel-id="history">
           <header class="panel-header">
             <h2>历史提示词</h2>
-            <div class="segmented" role="group" aria-label="历史范围">
-              <button id="historyAllButton" type="button" data-filter="all" class="is-active">全部</button>
-              <button id="historyCurrentButton" type="button" data-filter="current">当前</button>
+            <div class="panel-actions">
+              <div class="segmented" role="group" aria-label="历史范围">
+                <button id="historyAllButton" type="button" data-filter="all" class="is-active">全部</button>
+                <button id="historyCurrentButton" type="button" data-filter="current">当前</button>
+              </div>
+              <button class="panel-collapse-button" type="button" aria-label="收起历史提示词" aria-expanded="true" data-collapse-panel="history">⌃</button>
             </div>
           </header>
           <div id="historyList" class="history-list"></div>

@@ -65,6 +65,7 @@ let referenceImageDataUrl = "";
 let optimizedPromptCandidate = "";
 
 init();
+initPanelCollapsing();
 
 async function init() {
   try {
@@ -231,6 +232,30 @@ historyAllButton.addEventListener("click", () => setHistoryFilter("all"));
 historyCurrentButton.addEventListener("click", () => setHistoryFilter("current"));
 refineInsightsButton.addEventListener("click", refinePromptInsights);
 buildTemplateButton.addEventListener("click", insertPromptTemplate);
+
+function initPanelCollapsing() {
+  document.querySelectorAll(".panel[data-panel-id]").forEach(panel => {
+    const panelId = panel.dataset.panelId;
+    const button = panel.querySelector(`[data-collapse-panel="${panelId}"]`);
+    if (!panelId || !button) return;
+
+    const isCollapsed = localStorage.getItem(`panelCollapsed:${panelId}`) === "true";
+    setPanelCollapsed(panel, button, isCollapsed);
+    button.addEventListener("click", () => {
+      const nextCollapsed = !panel.classList.contains("is-collapsed");
+      setPanelCollapsed(panel, button, nextCollapsed);
+      localStorage.setItem(`panelCollapsed:${panelId}`, nextCollapsed ? "true" : "false");
+    });
+  });
+}
+
+function setPanelCollapsed(panel, button, isCollapsed) {
+  panel.classList.toggle("is-collapsed", isCollapsed);
+  button.setAttribute("aria-expanded", String(!isCollapsed));
+  button.textContent = isCollapsed ? "⌄" : "⌃";
+  const title = panel.querySelector("h2")?.textContent?.trim() || "模块";
+  button.setAttribute("aria-label", `${isCollapsed ? "展开" : "收起"}${title}`);
+}
 
 function renderAll() {
   renderChrome();
@@ -417,7 +442,7 @@ function renderHistory() {
   historyAllButton.classList.toggle("is-active", historyFilter === "all");
   historyCurrentButton.classList.toggle("is-active", historyFilter === "current");
   const rows = appState.history
-    .filter(item => historyFilter === "all" || item.canvasId === activeCanvasId)
+    .filter(item => !item.historyDeletedAt && (historyFilter === "all" || item.canvasId === activeCanvasId))
     .slice()
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
@@ -486,8 +511,34 @@ function createHistoryCard(item) {
   useButton.addEventListener("click", () => useHistoryPrompt(item.prompt));
   actions.append(useButton);
 
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.className = "text-button danger-text-button";
+  deleteButton.textContent = "删除";
+  deleteButton.addEventListener("click", () => deleteHistoryItem(item.id));
+  actions.append(deleteButton);
+
   card.append(promptButton, meta, actions);
   return card;
+}
+
+async function deleteHistoryItem(historyId) {
+  const item = appState.history.find(entry => entry.id === historyId);
+  if (!item) return;
+  if (!confirm("删除这条历史提示词？画布上的图片不会被删除。")) return;
+
+  try {
+    await apiDelete(`/api/history/${encodeURIComponent(historyId)}`);
+    appState.history = appState.history.map(entry => entry.id === historyId
+      ? { ...entry, historyDeletedAt: new Date().toISOString() }
+      : entry);
+    expandedHistoryPrompts.delete(historyId);
+    await refreshPromptInsights();
+    renderAll();
+    showStatus("历史提示词已删除，共性提示词已更新。", "success");
+  } catch (error) {
+    showStatus(`删除历史提示词失败：${error.message}`, "error");
+  }
 }
 
 function useHistoryPrompt(prompt) {
