@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -64,6 +64,8 @@ try {
 async function main() {
   await log(`Workflow ${runDate} ${runId} started`);
   const basePrompt = (await readText(path.join(rootDir, "workflow", "base-prompt.md"))).trim();
+  const projectGoal = (await readOptionalText(path.join(rootDir, "workflow", "project-goal.md"))).trim()
+    || "生成一个在小红书上容易让人记住、有视觉锚点、扁平插画风格的橘猫 IP。";
   const latestFeedback = await readLatestFeedback();
   const promptWithFeedback = latestFeedback
     ? `${basePrompt}\n\n人工修改意见（下次生成必须参考）：\n${latestFeedback}`
@@ -147,6 +149,24 @@ async function main() {
       y: 0
     });
     await archiveImage("03-gpt-image-2", data.image);
+    return data;
+  }, null);
+
+  await step("deepseek-suggest-next-prompt", async () => {
+    const promptRecords = await collectRecentPromptRecords();
+    const data = await apiJson("/api/workflow/suggest-prompt", {
+      method: "POST",
+      body: {
+        projectGoal,
+        basePrompt,
+        latestFeedback,
+        promptRecords
+      }
+    });
+    const suggestedPrompt = data.suggestedPrompt || "";
+    await writePrompt("05-deepseek-suggested-next.md", suggestedPrompt);
+    manifest.prompts.suggestedNextPrompt = suggestedPrompt;
+    manifest.prompts.suggestedNextPromptSourceCount = data.sourceCount || promptRecords.length;
     return data;
   }, null);
 }
@@ -255,6 +275,87 @@ async function readLatestFeedback() {
   return typeof data.feedback === "string" ? data.feedback.trim() : "";
 }
 
+async function collectRecentPromptRecords() {
+  const records = [];
+  const filenames = [
+    "00-base.md",
+    "01-with-feedback.md",
+    "02-deepseek-optimized.json",
+    "03-qwen-evaluation.json",
+    "04-qwen-improved.md"
+  ];
+
+  for (const date of recentLocalDates(3)) {
+    const datePromptDir = path.join(rootDir, settings.archiveDir || "runs", date, "prompts");
+    const promptDirs = [datePromptDir, ...(await listPromptHistoryDirs(datePromptDir))];
+    for (const promptSourceDir of promptDirs) {
+      const sourceName = path.relative(datePromptDir, promptSourceDir).replace(/\\/g, "/") || "latest";
+      for (const filename of filenames) {
+        const raw = await readOptionalText(path.join(promptSourceDir, filename));
+        const content = normalizePromptRecordContent(filename, raw);
+        if (content) records.push({
+          date,
+          name: `${sourceName}/${filename}`,
+          content: truncateText(content, 2200)
+        });
+      }
+    }
+  }
+
+  return dedupePromptRecords(records).slice(0, 24);
+}
+
+async function listPromptHistoryDirs(datePromptDir) {
+  const historyRoot = path.join(datePromptDir, "history");
+  try {
+    const entries = await readdir(historyRoot, { withFileTypes: true });
+    return entries
+      .filter(entry => entry.isDirectory())
+      .map(entry => path.join(historyRoot, entry.name))
+      .sort()
+      .reverse();
+  } catch {
+    return [];
+  }
+}
+
+function normalizePromptRecordContent(filename, raw) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (!text) return "";
+
+  if (filename.endsWith(".json")) {
+    const parsed = safeJsonParse(text);
+    if (!parsed) return text;
+    if (filename === "02-deepseek-optimized.json") {
+      return [
+        parsed.optimizedPrompt ? `DeepSeek 优化提示词：${parsed.optimizedPrompt}` : "",
+        Array.isArray(parsed.changes) && parsed.changes.length ? `优化变化：${parsed.changes.join("；")}` : ""
+      ].filter(Boolean).join("\n");
+    }
+    if (filename === "03-qwen-evaluation.json") {
+      const workflow = parsed.workflow || {};
+      return [
+        workflow.overall ? `Qwen 总体判断：${workflow.overall}` : "",
+        Array.isArray(workflow.issues) && workflow.issues.length ? `Qwen 问题：${workflow.issues.join("；")}` : "",
+        Array.isArray(workflow.suggestions) && workflow.suggestions.length ? `Qwen 修改建议：${workflow.suggestions.join("；")}` : "",
+        parsed.improvedPrompt || workflow.improvedPrompt ? `Qwen 改进提示词：${parsed.improvedPrompt || workflow.improvedPrompt}` : ""
+      ].filter(Boolean).join("\n");
+    }
+  }
+
+  return text;
+}
+
+function dedupePromptRecords(records) {
+  const seen = new Set();
+  return records.filter(record => {
+    const key = record.content;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 async function writeManifest() {
   const text = JSON.stringify(manifest, null, 2);
   await writeFile(path.join(runDir, "run.json"), text, "utf8");
@@ -276,6 +377,14 @@ async function readJson(filePath, fallback) {
 
 async function readText(filePath) {
   return readFile(filePath, "utf8");
+}
+
+async function readOptionalText(filePath) {
+  try {
+    return await readFile(filePath, "utf8");
+  } catch {
+    return "";
+  }
 }
 
 function safeJsonParse(text) {
@@ -300,11 +409,24 @@ function localDateString(date = new Date()) {
   return `${year}-${month}-${day}`;
 }
 
+function recentLocalDates(count) {
+  return Array.from({ length: count }, (_, index) => {
+    const date = new Date();
+    date.setDate(date.getDate() - index);
+    return localDateString(date);
+  });
+}
+
 function timeString(date = new Date()) {
   const hour = String(date.getHours()).padStart(2, "0");
   const minute = String(date.getMinutes()).padStart(2, "0");
   const second = String(date.getSeconds()).padStart(2, "0");
   return `${hour}${minute}${second}`;
+}
+
+function truncateText(value, maxLength) {
+  const text = String(value || "");
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
 function trimEnd(value, char) {

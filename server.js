@@ -117,6 +117,10 @@ const server = createServer(async (req, res) => {
       return handleWorkflowFeedbackSave(req, res);
     }
 
+    if (req.method === "POST" && url.pathname === "/api/workflow/suggest-prompt") {
+      return handleWorkflowSuggestPrompt(req, res);
+    }
+
     if (req.method === "GET" && url.pathname.startsWith("/workflow/runs/")) {
       return serveWorkflowRunFile(url.pathname, res);
     }
@@ -488,6 +492,7 @@ async function handleWorkflowFeedbackPage(url, res) {
   const promptSummary = await readOptionalText(path.join(runDir, "prompts", "04-qwen-improved.md"))
     || await readOptionalText(path.join(runDir, "prompts", "02-deepseek-optimized.json"))
     || "";
+  const suggestedPrompt = await readOptionalText(path.join(runDir, "prompts", "05-deepseek-suggested-next.md")) || "";
   const status = manifest.status || "unknown";
   const imageMarkup = imageFiles.map(file => {
     const src = `/workflow/runs/${encodeURIComponent(run)}/images/${encodeURIComponent(file)}`;
@@ -510,7 +515,9 @@ async function handleWorkflowFeedbackPage(url, res) {
       figcaption { padding: 10px; font-size: 13px; color: #64748b; word-break: break-all; }
       textarea { box-sizing: border-box; width: 100%; min-height: 150px; padding: 12px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; }
       button { margin-top: 10px; padding: 10px 16px; border: 0; border-radius: 8px; background: #2563eb; color: white; cursor: pointer; }
+      button.secondary { background: #0f766e; }
       pre { white-space: pre-wrap; background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; max-height: 280px; overflow: auto; }
+      .suggestion-actions { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
       .saved { color: #047857; margin-left: 10px; }
     </style>
   </head>
@@ -522,11 +529,23 @@ async function handleWorkflowFeedbackPage(url, res) {
       <div class="grid">${imageMarkup || "<p>暂无归档图片。</p>"}</div>
       <h2>最终提示词摘要</h2>
       <pre>${escapeHtml(promptSummary || "暂无提示词摘要。")}</pre>
+      <h2>建议尝试提示词</h2>
+      <pre id="suggestedPrompt">${escapeHtml(suggestedPrompt || "暂无建议尝试提示词。")}</pre>
+      <div class="suggestion-actions">
+        <button id="useSuggestedButton" class="secondary" type="button"${suggestedPrompt ? "" : " disabled"}>使用建议</button>
+        <span id="useSuggestedStatus" class="saved"></span>
+      </div>
       <h2>人工修改意见</h2>
       <textarea id="feedback" placeholder="写下你希望下次自动生成时采用的修改意见。">${escapeHtml(feedback)}</textarea>
       <div><button id="saveButton" type="button">保存意见</button><span id="saveStatus" class="saved"></span></div>
     </main>
     <script>
+      const suggestedPrompt = ${JSON.stringify(suggestedPrompt)};
+      document.querySelector("#useSuggestedButton").addEventListener("click", () => {
+        if (!suggestedPrompt) return;
+        document.querySelector("#feedback").value = suggestedPrompt;
+        document.querySelector("#useSuggestedStatus").textContent = "已填入，可修改后保存";
+      });
       document.querySelector("#saveButton").addEventListener("click", async () => {
         const response = await fetch("/api/workflow/feedback", {
           method: "POST",
@@ -559,6 +578,96 @@ async function handleWorkflowFeedbackSave(req, res) {
     }, null, 2), "utf8");
   }
   sendJson(res, 200, { ok: true, run, hasFeedback: Boolean(feedback) });
+}
+
+async function handleWorkflowSuggestPrompt(req, res) {
+  if (!config.deepseekApiKey) {
+    return sendJson(res, 500, { error: "DEEPSEEK_API_KEY is not configured" });
+  }
+
+  const body = await readJsonBody(req);
+  const projectGoal = typeof body.projectGoal === "string" && body.projectGoal.trim()
+    ? body.projectGoal.trim()
+    : "生成一个在小红书上容易让人记住、有视觉锚点、扁平插画风格的橘猫 IP。";
+  const basePrompt = typeof body.basePrompt === "string" ? body.basePrompt.trim() : "";
+  const latestFeedback = typeof body.latestFeedback === "string" ? body.latestFeedback.trim() : "";
+  const promptRecords = Array.isArray(body.promptRecords)
+    ? body.promptRecords
+        .map(record => ({
+          date: typeof record?.date === "string" ? record.date : "",
+          name: typeof record?.name === "string" ? record.name : "",
+          content: typeof record?.content === "string" ? record.content.trim() : ""
+        }))
+        .filter(record => record.content)
+        .slice(0, 40)
+    : [];
+
+  const apiResponse = await fetch(`${config.deepseekBaseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${config.deepseekApiKey}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: config.deepseekModel,
+      temperature: 0.35,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: [
+            "你是小红书 IP 形象提示词策略师。",
+            "请基于历史提示词和评价建议，输出严格 JSON。",
+            "JSON 字段：suggestedPrompt, rationale。",
+            "suggestedPrompt 必须是一条可直接用于图片生成的中文提示词。",
+            "优先强化可记忆视觉锚点、扁平插画风格、橘猫 IP 一致性。",
+            "不要输出 markdown。"
+          ].join("")
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            projectGoal,
+            basePrompt,
+            latestFeedback,
+            recentPromptRecords: promptRecords,
+            outputRequirements: [
+              "只给 1 条建议尝试提示词",
+              "保留橘猫主体和扁平插画方向",
+              "加入清晰、可复现、容易记住的视觉锚点",
+              "适合小红书头像、贴纸或封面图传播",
+              "避免过多互相冲突的元素"
+            ]
+          })
+        }
+      ]
+    })
+  });
+
+  const responseText = await apiResponse.text();
+  const parsed = parseJsonResponseText(responseText);
+  if (!apiResponse.ok) {
+    return sendJson(res, apiResponse.status, {
+      error: "DeepSeek workflow prompt suggestion failed",
+      detail: normalizeApiError(parsed)
+    });
+  }
+
+  const content = parsed?.choices?.[0]?.message?.content;
+  const suggested = typeof content === "string" ? parseJsonFromText(content) || safeJsonParse(content) : null;
+  if (!suggested) {
+    return sendJson(res, 502, { error: "DeepSeek suggestion response was not valid JSON", detail: content || parsed });
+  }
+
+  const suggestedPrompt = typeof suggested.suggestedPrompt === "string" && suggested.suggestedPrompt.trim()
+    ? suggested.suggestedPrompt.trim()
+    : basePrompt;
+  sendJson(res, 200, {
+    suggestedPrompt,
+    rationale: typeof suggested.rationale === "string" ? suggested.rationale.trim() : "",
+    sourceCount: promptRecords.length,
+    model: config.deepseekModel
+  });
 }
 
 async function handleImportImages(req, res) {

@@ -37,3 +37,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\register-daily-tas
 ```
 
 After a run, open `http://localhost:8787/workflow/feedback?run=YYYY-MM-DD` to review images and save the next manual revision note. The next workflow run uses only the latest non-empty feedback.
+
+The workflow also reads `workflow/project-goal.md` and recent run prompts to generate a suggested next prompt. On the feedback page, click "使用建议" to copy that suggestion into the manual feedback box before saving.

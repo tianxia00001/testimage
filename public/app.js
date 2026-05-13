@@ -60,7 +60,10 @@ let expandedHistoryPrompts = new Set();
 let refineConfirmed = localStorage.getItem("promptRefineConfirmed") === "true";
 let viewportSaveTimer = 0;
 let interaction = null;
-let placeholder = null;
+let generationJobs = new Map();
+let generationCompletedCount = 0;
+let generationFailedCount = 0;
+let generationStatusHideTimer = 0;
 let referenceImageDataUrl = "";
 let optimizedPromptCandidate = "";
 
@@ -185,8 +188,12 @@ form.addEventListener("submit", async event => {
 
   const canvasId = activeCanvasId;
   const target = { ...selectedTarget };
-  placeholder = {
-    id: "placeholder",
+  const provider = imageModelSelect.value;
+  const size = sizeInput.value;
+  const referenceImages = referenceImageDataUrl ? [referenceImageDataUrl] : [];
+  const jobId = createClientId("generation");
+  const placeholder = {
+    id: jobId,
     canvasId,
     x: target.x,
     y: target.y,
@@ -194,9 +201,16 @@ form.addEventListener("submit", async event => {
     height: 280,
     prompt
   };
+  if (generationJobs.size === 0) {
+    generationCompletedCount = 0;
+    generationFailedCount = 0;
+  }
+  clearTimeout(generationStatusHideTimer);
+  generationJobs.set(jobId, placeholder);
+  selectedTarget = null;
   renderImages();
-  setGenerating(true);
-  showStatus("正在生成图片...", "info");
+  renderTarget();
+  updateGenerationStatus();
 
   try {
     const data = await apiJson("/api/generate", {
@@ -206,25 +220,23 @@ form.addEventListener("submit", async event => {
         prompt,
         x: target.x,
         y: target.y,
-        provider: imageModelSelect.value,
-        size: sizeInput.value,
-        referenceImages: referenceImageDataUrl ? [referenceImageDataUrl] : []
+        provider,
+        size,
+        referenceImages
       }
     });
     appState.images.push(data.image);
     appState.history.push(data.history);
-    selectedTarget = null;
+    generationCompletedCount += 1;
     selectSingleImage(data.image.id);
-    promptInput.value = "";
-    clearReferenceImage();
     await refreshPromptInsights();
-    showStatus("生成完成。", "success");
   } catch (error) {
-    showStatus(`生成失败：${error.message}`, "error");
+    generationFailedCount += 1;
+    console.error(error);
   } finally {
-    placeholder = null;
-    setGenerating(false);
+    generationJobs.delete(jobId);
     renderAll();
+    updateGenerationStatus();
   }
 });
 
@@ -375,12 +387,13 @@ function renderViewport() {
 function renderImages() {
   canvasWorld.replaceChildren();
   const visibleImages = appState.images.filter(image => image.canvasId === activeCanvasId);
-  canvasHint.hidden = visibleImages.length > 0 || Boolean(placeholder);
+  const visiblePlaceholders = Array.from(generationJobs.values()).filter(item => item.canvasId === activeCanvasId);
+  canvasHint.hidden = visibleImages.length > 0 || visiblePlaceholders.length > 0;
 
   for (const image of visibleImages) {
     canvasWorld.append(createImageNode(image));
   }
-  if (placeholder?.canvasId === activeCanvasId) {
+  for (const placeholder of visiblePlaceholders) {
     canvasWorld.append(createPlaceholderNode(placeholder));
   }
 }
@@ -414,11 +427,12 @@ function createImageNode(image) {
 function createPlaceholderNode(item) {
   const node = document.createElement("article");
   node.className = "image-node placeholder-node";
+  node.dataset.imageId = item.id;
   node.style.left = `${item.x}px`;
   node.style.top = `${item.y}px`;
   node.style.width = `${item.width}px`;
   node.style.height = `${item.height}px`;
-  node.innerHTML = `<div class="placeholder-spinner"></div><span>生成中...</span>`;
+  node.innerHTML = `<div class="placeholder-spinner"></div><span>生成中...</span><small>${escapeHtml(item.prompt)}</small>`;
   return node;
 }
 
@@ -1252,9 +1266,8 @@ function setActiveCanvas(canvasId, options = {}) {
   if (!options.keepTarget) selectedTarget = null;
   clearImageSelection();
   expandedInsightGroups = new Set();
-  placeholder = null;
   aiInsights = null;
-  clearStatus();
+  if (generationJobs.size === 0) clearStatus();
   refreshPromptInsights();
   renderAll();
 }
@@ -1301,10 +1314,25 @@ function queueViewportSave() {
   viewportSaveTimer = setTimeout(saveActiveViewport, VIEWPORT_SAVE_DELAY);
 }
 
-function setGenerating(isGenerating) {
-  generateButton.disabled = isGenerating || !selectedTarget;
-  generateButton.textContent = isGenerating ? "生成中..." : "生成到画布";
-  promptInput.disabled = isGenerating;
+function updateGenerationStatus() {
+  const running = generationJobs.size;
+  if (running > 0) {
+    clearTimeout(generationStatusHideTimer);
+    const failedText = generationFailedCount > 0 ? `，失败 ${generationFailedCount} 张` : "";
+    showStatus(`正在生成 ${running} 张，已完成 ${generationCompletedCount} 张${failedText}`, generationFailedCount > 0 ? "error" : "info");
+    return;
+  }
+
+  if (generationCompletedCount > 0 || generationFailedCount > 0) {
+    const failedText = generationFailedCount > 0 ? `，失败 ${generationFailedCount} 张` : "";
+    showStatus(`生成结束：已完成 ${generationCompletedCount} 张${failedText}`, generationFailedCount > 0 ? "error" : "success");
+    clearTimeout(generationStatusHideTimer);
+    generationStatusHideTimer = setTimeout(() => {
+      clearStatus();
+      generationCompletedCount = 0;
+      generationFailedCount = 0;
+    }, 2200);
+  }
 }
 
 function showStatus(message, tone) {
@@ -1373,6 +1401,10 @@ function formatTime(value) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function createClientId(prefix) {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 10)}`;
 }
 
 function escapeHtml(value) {
