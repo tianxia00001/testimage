@@ -498,6 +498,7 @@ async function handleWorkflowFeedbackPage(url, res) {
     const src = `/workflow/runs/${encodeURIComponent(run)}/images/${encodeURIComponent(file)}`;
     return `<figure><img src="${src}" alt="${escapeHtml(file)}"><figcaption>${escapeHtml(file)}</figcaption></figure>`;
   }).join("");
+  const errorMarkup = formatWorkflowErrors(manifest.errors);
   const html = `<!doctype html>
 <html lang="zh-CN">
   <head>
@@ -525,6 +526,7 @@ async function handleWorkflowFeedbackPage(url, res) {
     <main>
       <h1>每日工作流反馈</h1>
       <div class="meta">日期：${escapeHtml(run)} · 状态：${escapeHtml(status)} · 归档：runs/${escapeHtml(run)}</div>
+      ${errorMarkup}
       <h2>生成图片</h2>
       <div class="grid">${imageMarkup || "<p>暂无归档图片。</p>"}</div>
       <h2>最终提示词摘要</h2>
@@ -580,6 +582,14 @@ async function handleWorkflowFeedbackSave(req, res) {
   sendJson(res, 200, { ok: true, run, hasFeedback: Boolean(feedback) });
 }
 
+function formatWorkflowErrors(errors) {
+  if (!Array.isArray(errors) || errors.length === 0) return "";
+  const lines = errors
+    .map(error => `${error.name || "unknown"}：${error.error || "执行失败"}`)
+    .join("\n");
+  return `<h2>失败步骤</h2><pre>${escapeHtml(lines)}</pre>`;
+}
+
 async function handleWorkflowSuggestPrompt(req, res) {
   if (!config.deepseekApiKey) {
     return sendJson(res, 500, { error: "DEEPSEEK_API_KEY is not configured" });
@@ -591,6 +601,7 @@ async function handleWorkflowSuggestPrompt(req, res) {
     : "生成一个在小红书上容易让人记住、有视觉锚点、扁平插画风格的橘猫 IP。";
   const basePrompt = typeof body.basePrompt === "string" ? body.basePrompt.trim() : "";
   const latestFeedback = typeof body.latestFeedback === "string" ? body.latestFeedback.trim() : "";
+  const currentPrompt = typeof body.currentPrompt === "string" ? body.currentPrompt.trim() : "";
   const promptRecords = Array.isArray(body.promptRecords)
     ? body.promptRecords
         .map(record => ({
@@ -620,7 +631,9 @@ async function handleWorkflowSuggestPrompt(req, res) {
             "请基于历史提示词和评价建议，输出严格 JSON。",
             "JSON 字段：suggestedPrompt, rationale。",
             "suggestedPrompt 必须是一条可直接用于图片生成的中文提示词。",
+            "suggestedPrompt 必须是下一轮实验提示词，不能原样复制 currentPrompt 或历史提示词。",
             "优先强化可记忆视觉锚点、扁平插画风格、橘猫 IP 一致性。",
+            "如果当前提示词已经较好，也必须提出 1-2 个明确可测试变化，例如构图、表情、视觉锚点取舍或约束简化。",
             "不要输出 markdown。"
           ].join("")
         },
@@ -630,9 +643,12 @@ async function handleWorkflowSuggestPrompt(req, res) {
             projectGoal,
             basePrompt,
             latestFeedback,
+            currentPrompt,
             recentPromptRecords: promptRecords,
             outputRequirements: [
               "只给 1 条建议尝试提示词",
+              "不要复制 currentPrompt，也不要复制 recentPromptRecords 中已有的完整提示词",
+              "必须明确下一轮实验重点，且和 currentPrompt 有可见差异",
               "保留橘猫主体和扁平插画方向",
               "加入清晰、可复现、容易记住的视觉锚点",
               "适合小红书头像、贴纸或封面图传播",
@@ -659,15 +675,53 @@ async function handleWorkflowSuggestPrompt(req, res) {
     return sendJson(res, 502, { error: "DeepSeek suggestion response was not valid JSON", detail: content || parsed });
   }
 
-  const suggestedPrompt = typeof suggested.suggestedPrompt === "string" && suggested.suggestedPrompt.trim()
+  let suggestedPrompt = typeof suggested.suggestedPrompt === "string" && suggested.suggestedPrompt.trim()
     ? suggested.suggestedPrompt.trim()
-    : basePrompt;
+    : currentPrompt || basePrompt;
+  let rationale = typeof suggested.rationale === "string" ? suggested.rationale.trim() : "";
+  const existingPrompts = [
+    basePrompt,
+    currentPrompt,
+    ...promptRecords.map(record => record.content)
+  ].filter(Boolean);
+  if (isDuplicatePrompt(suggestedPrompt, existingPrompts)) {
+    suggestedPrompt = buildNextExperimentPrompt({ currentPrompt, basePrompt, latestFeedback });
+    rationale = rationale
+      ? `${rationale}\nDeepSeek 返回内容与现有提示词重复，已自动改写为下一轮实验提示词。`
+      : "DeepSeek 返回内容与现有提示词重复，已自动改写为下一轮实验提示词。";
+  }
   sendJson(res, 200, {
     suggestedPrompt,
-    rationale: typeof suggested.rationale === "string" ? suggested.rationale.trim() : "",
+    rationale,
     sourceCount: promptRecords.length,
     model: config.deepseekModel
   });
+}
+
+function isDuplicatePrompt(candidate, prompts) {
+  const normalizedCandidate = normalizePromptForCompare(candidate);
+  if (!normalizedCandidate) return true;
+  return prompts.some(prompt => normalizePromptForCompare(prompt) === normalizedCandidate);
+}
+
+function normalizePromptForCompare(value) {
+  return String(value || "")
+    .replace(/\s+/g, "")
+    .replace(/[，。；：、,.，;:]/g, "")
+    .trim();
+}
+
+function buildNextExperimentPrompt({ currentPrompt, basePrompt, latestFeedback }) {
+  const foundation = currentPrompt || basePrompt || "扁平矢量插画风格，一只原创橘猫 IP，纯白背景。";
+  const feedback = latestFeedback ? `同时吸收人工反馈：${latestFeedback}。` : "";
+  return [
+    "原创橘猫 IP 形象，扁平矢量插画风格，适合小红书头像和贴纸传播。",
+    "本轮实验重点：保留 2 头身圆滚滚橘猫、橘白配色、纯白背景，但把视觉锚点收敛为“右耳趴下 + 红色小蝴蝶结 + 半眯斜视的傲娇表情”。",
+    "构图改为正面居中头像式全身，头大身体短，四肢极短，腹部圆润；虎斑纹简洁清晰，线条统一黑色描边。",
+    "减少过细硬性约束，不再强调精确线宽和固定胡须数量，优先保证角色可爱、容易记住、重复生成时特征稳定。",
+    feedback,
+    `参考上一轮方向：${foundation}`
+  ].filter(Boolean).join("");
 }
 
 async function handleImportImages(req, res) {
@@ -1016,6 +1070,24 @@ async function generateOpenRouterImage({ prompt, size, referenceImages, model })
 async function postOpenRouterJson(payload) {
   const url = `${config.openrouterBaseUrl}/chat/completions`;
   const headers = openRouterHeaders();
+  try {
+    return await postOpenRouterJsonWithCurl(url, headers, payload);
+  } catch (curlError) {
+    const fetchResult = await postOpenRouterJsonWithFetch(url, headers, payload);
+    if (fetchResult.ok) return fetchResult;
+    return {
+      ...fetchResult,
+      text: JSON.stringify({
+        error: "OpenRouter curl request failed and fetch fallback also failed",
+        curlError: curlError.message,
+        fetchStatus: fetchResult.status,
+        fetchResponse: normalizeApiError(parseJsonResponseText(fetchResult.text))
+      })
+    };
+  }
+}
+
+async function postOpenRouterJsonWithFetch(url, headers, payload) {
   const response = await fetch(url, {
     method: "POST",
     headers,
@@ -1029,22 +1101,6 @@ async function postOpenRouterJson(payload) {
     requestId: response.headers.get("x-request-id") || response.headers.get("cf-ray") || null,
     transport: "fetch"
   };
-
-  if (response.status === 500 && text.trim() === "Internal Server Error") {
-    try {
-      return await postOpenRouterJsonWithCurl(url, headers, payload);
-    } catch (error) {
-      return {
-        ...result,
-        text: JSON.stringify({
-          error: "OpenRouter returned Internal Server Error through fetch and curl fallback failed",
-          fetchResponse: text,
-          fallbackError: error.message
-        })
-      };
-    }
-  }
-
   return result;
 }
 

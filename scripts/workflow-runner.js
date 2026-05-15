@@ -160,6 +160,7 @@ async function main() {
         projectGoal,
         basePrompt,
         latestFeedback,
+        currentPrompt: improvedPrompt,
         promptRecords
       }
     });
@@ -253,7 +254,8 @@ async function apiJson(route, options = {}) {
   const data = text ? safeJsonParse(text) : {};
   if (!response.ok) {
     const detail = typeof data?.detail === "string" ? data.detail : JSON.stringify(data?.detail || data || text);
-    throw new Error(`${route} failed with ${response.status}: ${data?.error || detail}`);
+    const message = data?.error ? `${data.error}: ${detail}` : detail;
+    throw new Error(`${route} failed with ${response.status}: ${message}`);
   }
   return data;
 }
