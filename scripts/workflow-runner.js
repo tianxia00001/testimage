@@ -154,19 +154,25 @@ async function main() {
 
   await step("deepseek-suggest-next-prompt", async () => {
     const promptRecords = await collectRecentPromptRecords();
+    const visualAnchorPool = await readJson(path.join(rootDir, "workflow", "visual-anchor-pool.json"), {});
     const data = await apiJson("/api/workflow/suggest-prompt", {
       method: "POST",
       body: {
+        runDate,
         projectGoal,
         basePrompt,
         latestFeedback,
         currentPrompt: improvedPrompt,
-        promptRecords
+        promptRecords,
+        visualAnchorPool
       }
     });
     const suggestedPrompt = data.suggestedPrompt || "";
     await writePrompt("05-deepseek-suggested-next.md", suggestedPrompt);
+    await writePrompt("05-deepseek-suggested-next.json", JSON.stringify(data, null, 2));
     manifest.prompts.suggestedNextPrompt = suggestedPrompt;
+    manifest.prompts.suggestedExperimentDirection = data.experimentDirection || "";
+    manifest.prompts.suggestedChangedAnchors = Array.isArray(data.changedAnchors) ? data.changedAnchors : [];
     manifest.prompts.suggestedNextPromptSourceCount = data.sourceCount || promptRecords.length;
     return data;
   }, null);

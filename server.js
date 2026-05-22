@@ -493,6 +493,7 @@ async function handleWorkflowFeedbackPage(url, res) {
     || await readOptionalText(path.join(runDir, "prompts", "02-deepseek-optimized.json"))
     || "";
   const suggestedPrompt = await readOptionalText(path.join(runDir, "prompts", "05-deepseek-suggested-next.md")) || "";
+  const suggestedMeta = await readOptionalJson(path.join(runDir, "prompts", "05-deepseek-suggested-next.json")) || {};
   const status = manifest.status || "unknown";
   const imageMarkup = imageFiles.map(file => {
     const src = `/workflow/runs/${encodeURIComponent(run)}/images/${encodeURIComponent(file)}`;
@@ -518,6 +519,9 @@ async function handleWorkflowFeedbackPage(url, res) {
       button { margin-top: 10px; padding: 10px 16px; border: 0; border-radius: 8px; background: #2563eb; color: white; cursor: pointer; }
       button.secondary { background: #0f766e; }
       pre { white-space: pre-wrap; background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; max-height: 280px; overflow: auto; }
+      .suggested-experiment { background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+      .suggested-experiment p { margin: 0 0 8px; }
+      .suggested-experiment p:last-child { margin-bottom: 0; }
       .suggestion-actions { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
       .saved { color: #047857; margin-left: 10px; }
     </style>
@@ -532,6 +536,7 @@ async function handleWorkflowFeedbackPage(url, res) {
       <h2>最终提示词摘要</h2>
       <pre>${escapeHtml(promptSummary || "暂无提示词摘要。")}</pre>
       <h2>建议尝试提示词</h2>
+      ${formatSuggestedExperiment(suggestedMeta)}
       <pre id="suggestedPrompt">${escapeHtml(suggestedPrompt || "暂无建议尝试提示词。")}</pre>
       <div class="suggestion-actions">
         <button id="useSuggestedButton" class="secondary" type="button"${suggestedPrompt ? "" : " disabled"}>使用建议</button>
@@ -590,6 +595,19 @@ function formatWorkflowErrors(errors) {
   return `<h2>失败步骤</h2><pre>${escapeHtml(lines)}</pre>`;
 }
 
+function formatSuggestedExperiment(meta) {
+  const direction = typeof meta?.experimentDirection === "string" ? meta.experimentDirection.trim() : "";
+  const anchors = Array.isArray(meta?.changedAnchors) ? meta.changedAnchors.filter(item => typeof item === "string" && item.trim()) : [];
+  if (!direction && anchors.length === 0) return "";
+  const anchorMarkup = anchors.length > 0
+    ? `<p><strong>改动锚点：</strong>${escapeHtml(anchors.join(" / "))}</p>`
+    : "";
+  const directionMarkup = direction
+    ? `<p><strong>实验方向：</strong>${escapeHtml(direction)}</p>`
+    : "";
+  return `<section class="suggested-experiment">${directionMarkup}${anchorMarkup}</section>`;
+}
+
 async function handleWorkflowSuggestPrompt(req, res) {
   if (!config.deepseekApiKey) {
     return sendJson(res, 500, { error: "DEEPSEEK_API_KEY is not configured" });
@@ -602,6 +620,8 @@ async function handleWorkflowSuggestPrompt(req, res) {
   const basePrompt = typeof body.basePrompt === "string" ? body.basePrompt.trim() : "";
   const latestFeedback = typeof body.latestFeedback === "string" ? body.latestFeedback.trim() : "";
   const currentPrompt = typeof body.currentPrompt === "string" ? body.currentPrompt.trim() : "";
+  const runDate = sanitizeRunDate(body.runDate) || localDateString();
+  const visualAnchorPool = normalizeVisualAnchorPool(body.visualAnchorPool);
   const promptRecords = Array.isArray(body.promptRecords)
     ? body.promptRecords
         .map(record => ({
@@ -629,11 +649,16 @@ async function handleWorkflowSuggestPrompt(req, res) {
           content: [
             "你是小红书 IP 形象提示词策略师。",
             "请基于历史提示词和评价建议，输出严格 JSON。",
-            "JSON 字段：suggestedPrompt, rationale。",
+            "JSON 字段：experimentDirection, changedAnchors, suggestedPrompt, rationale。",
+            "experimentDirection 用一句中文说明本轮明显实验方向。",
+            "changedAnchors 必须是 1-2 个字符串，格式为：分类：锚点。",
             "suggestedPrompt 必须是一条可直接用于图片生成的中文提示词。",
             "suggestedPrompt 必须是下一轮实验提示词，不能原样复制 currentPrompt 或历史提示词。",
-            "优先强化可记忆视觉锚点、扁平插画风格、橘猫 IP 一致性。",
-            "如果当前提示词已经较好，也必须提出 1-2 个明确可测试变化，例如构图、表情、视觉锚点取舍或约束简化。",
+            "只允许从 visualAnchorPool 里选择锚点变化，不要使用性格或姿态方向。",
+            "不要默认保留蝴蝶结；配饰可以改成围巾、项圈、胸针、小皇冠、小墨镜、邮差包、红色笔记本等。",
+            "建议必须有明显变化，不能只增加小爱心、线宽、胡须数量、颜色饱和度这类弱变化。",
+            "固定底座必须保留：橘猫、扁平插画、干净背景、小红书 IP、高记忆点。",
+            "每次最多改 2 个主锚点，避免变成完全不同的角色。",
             "不要输出 markdown。"
           ].join("")
         },
@@ -644,12 +669,16 @@ async function handleWorkflowSuggestPrompt(req, res) {
             basePrompt,
             latestFeedback,
             currentPrompt,
+            visualAnchorPool,
             recentPromptRecords: promptRecords,
             outputRequirements: [
-              "只给 1 条建议尝试提示词",
+              "只给 1 个明显实验方向和 1 条建议尝试提示词",
               "不要复制 currentPrompt，也不要复制 recentPromptRecords 中已有的完整提示词",
-              "必须明确下一轮实验重点，且和 currentPrompt 有可见差异",
+              "必须从 visualAnchorPool 中选择 1-2 个锚点，写入 changedAnchors",
+              "必须明确下一轮实验重点，且和 currentPrompt 有明显可见差异",
               "保留橘猫主体和扁平插画方向",
+              "优先测试道具/配饰、头身比、眼睛、耳朵、尾巴/花纹、其它视觉锚点",
+              "不要使用性格或姿态方向",
               "加入清晰、可复现、容易记住的视觉锚点",
               "适合小红书头像、贴纸或封面图传播",
               "避免过多互相冲突的元素"
@@ -678,19 +707,24 @@ async function handleWorkflowSuggestPrompt(req, res) {
   let suggestedPrompt = typeof suggested.suggestedPrompt === "string" && suggested.suggestedPrompt.trim()
     ? suggested.suggestedPrompt.trim()
     : currentPrompt || basePrompt;
+  let experimentDirection = typeof suggested.experimentDirection === "string" ? suggested.experimentDirection.trim() : "";
+  let changedAnchors = normalizeChangedAnchors(suggested.changedAnchors, visualAnchorPool);
   let rationale = typeof suggested.rationale === "string" ? suggested.rationale.trim() : "";
   const existingPrompts = [
     basePrompt,
     currentPrompt,
     ...promptRecords.map(record => record.content)
   ].filter(Boolean);
-  if (isDuplicatePrompt(suggestedPrompt, existingPrompts)) {
-    suggestedPrompt = buildNextExperimentPrompt({ currentPrompt, basePrompt, latestFeedback });
-    rationale = rationale
-      ? `${rationale}\nDeepSeek 返回内容与现有提示词重复，已自动改写为下一轮实验提示词。`
-      : "DeepSeek 返回内容与现有提示词重复，已自动改写为下一轮实验提示词。";
+  if (isDuplicatePrompt(suggestedPrompt, existingPrompts) || changedAnchors.length === 0) {
+    const fallback = buildNextExperimentPrompt({ currentPrompt, basePrompt, latestFeedback, visualAnchorPool, seed: runDate });
+    suggestedPrompt = fallback.suggestedPrompt;
+    experimentDirection = fallback.experimentDirection;
+    changedAnchors = fallback.changedAnchors;
+    rationale = fallback.rationale;
   }
   sendJson(res, 200, {
+    experimentDirection,
+    changedAnchors,
     suggestedPrompt,
     rationale,
     sourceCount: promptRecords.length,
@@ -711,17 +745,120 @@ function normalizePromptForCompare(value) {
     .trim();
 }
 
-function buildNextExperimentPrompt({ currentPrompt, basePrompt, latestFeedback }) {
+function normalizeVisualAnchorPool(input) {
+  const fallback = {
+    accessory: {
+      label: "道具/配饰",
+      items: ["红色小围巾", "小铃铛项圈", "鱼形胸针", "小皇冠", "方形小墨镜", "迷你邮差包", "小红书红色笔记本"]
+    },
+    proportion: {
+      label: "头身比",
+      items: ["1.5头身", "2头身", "大头小身体", "圆球身体", "梨形身体"]
+    },
+    eyes: {
+      label: "眼睛形态",
+      items: ["半眯死鱼眼", "一睁一眯", "倒三角嫌弃眼", "小豆豆眼", "下垂困困眼", "单边挑眉"]
+    },
+    ears: {
+      label: "耳朵形态",
+      items: ["一趴一竖", "一只耳朵小缺口", "小耳朵贴头", "大三角耳", "耳尖白色", "耳朵挂小标签"]
+    },
+    tailPattern: {
+      label: "尾巴/花纹",
+      items: ["问号尾巴", "短圆尾巴", "尾巴末端白色", "额头闪电纹", "胸口云朵白斑", "肚皮爱心白斑", "半边脸分色"]
+    },
+    other: {
+      label: "其它视觉锚点",
+      items: ["固定红色点缀", "脸颊圆形腮红", "粗黑外轮廓", "低细节贴纸感", "头像式居中构图"]
+    }
+  };
+  const source = input && typeof input === "object" ? input : fallback;
+  const normalized = {};
+  for (const key of ["accessory", "proportion", "eyes", "ears", "tailPattern", "other"]) {
+    const group = source[key] && typeof source[key] === "object" ? source[key] : fallback[key];
+    const label = typeof group.label === "string" && group.label.trim() ? group.label.trim() : fallback[key].label;
+    const items = Array.isArray(group.items)
+      ? group.items.filter(item => typeof item === "string" && item.trim()).map(item => item.trim()).slice(0, 12)
+      : fallback[key].items;
+    normalized[key] = { label, items: items.length > 0 ? items : fallback[key].items };
+  }
+  return normalized;
+}
+
+function normalizeChangedAnchors(input, visualAnchorPool) {
+  if (!Array.isArray(input)) return [];
+  const allowed = new Map();
+  for (const group of Object.values(visualAnchorPool)) {
+    for (const item of group.items) {
+      allowed.set(normalizePromptForCompare(`${group.label}:${item}`), `${group.label}：${item}`);
+      allowed.set(normalizePromptForCompare(`${group.label}：${item}`), `${group.label}：${item}`);
+      allowed.set(normalizePromptForCompare(item), `${group.label}：${item}`);
+    }
+  }
+  const result = [];
+  const seen = new Set();
+  for (const value of input) {
+    if (typeof value !== "string") continue;
+    const matched = allowed.get(normalizePromptForCompare(value));
+    if (!matched || seen.has(matched)) continue;
+    seen.add(matched);
+    result.push(matched);
+    if (result.length >= 2) break;
+  }
+  return result;
+}
+
+function buildNextExperimentPrompt({ currentPrompt, basePrompt, latestFeedback, visualAnchorPool, seed }) {
   const foundation = currentPrompt || basePrompt || "扁平矢量插画风格，一只原创橘猫 IP，纯白背景。";
   const feedback = latestFeedback ? `同时吸收人工反馈：${latestFeedback}。` : "";
-  return [
+  const anchors = pickAnchorExperiment(visualAnchorPool, seed || foundation);
+  const anchorText = anchors.map(anchor => `${anchor.label}：${anchor.item}`).join(" + ");
+  const suggestedPrompt = [
     "原创橘猫 IP 形象，扁平矢量插画风格，适合小红书头像和贴纸传播。",
-    "本轮实验重点：保留 2 头身圆滚滚橘猫、橘白配色、纯白背景，但把视觉锚点收敛为“右耳趴下 + 红色小蝴蝶结 + 半眯斜视的傲娇表情”。",
-    "构图改为正面居中头像式全身，头大身体短，四肢极短，腹部圆润；虎斑纹简洁清晰，线条统一黑色描边。",
-    "减少过细硬性约束，不再强调精确线宽和固定胡须数量，优先保证角色可爱、容易记住、重复生成时特征稳定。",
+    `本轮实验重点：测试“${anchorText}”是否比上一轮锚点更有记忆度。`,
+    "固定底座：橘猫主体、扁平插画、干净纯色背景、低细节贴纸感、高识别轮廓。",
+    buildAnchorPromptSentence(anchors),
+    "不要默认保留蝴蝶结；如果本轮配饰不是蝴蝶结，则明确不要蝴蝶结。避免加入性格设定或动作姿态实验。",
     feedback,
     `参考上一轮方向：${foundation}`
   ].filter(Boolean).join("");
+  return {
+    experimentDirection: `测试 ${anchorText} 作为新的橘猫 IP 视觉锚点。`,
+    changedAnchors: anchors.map(anchor => `${anchor.label}：${anchor.item}`),
+    suggestedPrompt,
+    rationale: `本轮强制选择 ${anchorText}，用于避免建议提示词继续围绕上一轮做微调。`
+  };
+}
+
+function pickAnchorExperiment(visualAnchorPool, seed) {
+  const groups = Object.entries(visualAnchorPool);
+  const hash = hashText(seed);
+  const firstIndex = hash % groups.length;
+  let secondIndex = Math.floor(hash / groups.length) % groups.length;
+  if (secondIndex === firstIndex) secondIndex = (secondIndex + 2) % groups.length;
+  return [groups[firstIndex], groups[secondIndex]].map(([key, group], index) => {
+    const itemIndex = Math.floor(hash / (index + 3)) % group.items.length;
+    return { key, label: group.label, item: group.items[itemIndex] };
+  });
+}
+
+function buildAnchorPromptSentence(anchors) {
+  return anchors.map(anchor => {
+    if (anchor.key === "accessory") return `配饰锚点改为${anchor.item}，作为画面中最醒目的红色/造型记忆点。`;
+    if (anchor.key === "proportion") return `头身比锚点改为${anchor.item}，强化远看就能识别的身体轮廓。`;
+    if (anchor.key === "eyes") return `眼睛锚点改为${anchor.item}，让脸部识别度明显区别于上一版。`;
+    if (anchor.key === "ears") return `耳朵锚点改为${anchor.item}，保持耳朵特征清晰可复现。`;
+    if (anchor.key === "tailPattern") return `尾巴/花纹锚点改为${anchor.item}，形成可反复出现的图形记忆点。`;
+    return `其它视觉锚点改为${anchor.item}，强化小红书头像和贴纸场景下的第一眼识别。`;
+  }).join("");
+}
+
+function hashText(value) {
+  let hash = 0;
+  for (const char of String(value || "")) {
+    hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  }
+  return hash;
 }
 
 async function handleImportImages(req, res) {
